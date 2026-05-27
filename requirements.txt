@@ -1,8 +1,7 @@
 functions-framework==3.*
 google-cloud-documentai==2.*
-google-cloud-aiplatform==1.*
 google-cloud-storage==2.*
-google-cloud-secret-manager==2.*
 cloud-sql-python-connector[pg8000]==1.*
 pg8000==1.*
+vertexai>=1.38.0
 requests==2.*
