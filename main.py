@@ -131,7 +131,7 @@ def procesar_receta(request):
 
         # ── PASO 3: Guardar en Cloud Storage ──────────────────
         ext            = "pdf" if es_pdf_flag else "jpg"
-        now_lima       = datetime.now(LIMA_TZ)
+        now_lima = datetime.now(LIMA_TZ)
         archivo_nombre = f"recetas-entrantes/{celular}_{now_lima.strftime('%Y%m%d_%H%M%S')}.{ext}"
         guardar_en_storage(archivo_bytes, archivo_nombre, mime_type)
 
@@ -341,7 +341,7 @@ def guardar_receta_manuscrita(
     celular: str, doi: str, chat_id: str,
     archivo_url: str, confianza_ocr: float
 ) -> int:
-    now_lima        = datetime.now(LIMA_TZ)
+    now_lima = datetime.now(LIMA_TZ).replace(tzinfo=None)
     conn, connector = get_db_connection()
     cur             = conn.cursor()
     try:
@@ -390,7 +390,7 @@ def guardar_en_base_datos(
     celular: str, doi: str, chat_id: str,
     archivo_url: str, analisis: dict, confianza_ocr: float
 ) -> int:
-    now_lima        = datetime.now(LIMA_TZ)
+    now_lima = datetime.now(LIMA_TZ).replace(tzinfo=None)
     conn, connector = get_db_connection()
     cur             = conn.cursor()
 
