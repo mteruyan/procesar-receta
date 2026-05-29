@@ -63,6 +63,10 @@ def get_db_connection():
         INSTANCE_CONN, "pg8000",
         user=DB_USER, password=DB_PASS, db=DB_NAME
     )
+    cur = conn.cursor()
+    cur.execute("SET TIME ZONE 'America/Lima'")
+    conn.commit()
+    cur.close()
     return conn, connector
 
 # ──────────────────────────────────────────────────────────────
