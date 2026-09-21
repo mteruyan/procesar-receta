@@ -5,3 +5,4 @@ cloud-sql-python-connector[pg8000]==1.*
 pg8000==1.*
 vertexai>=1.38.0
 requests==2.*
+google-genai
