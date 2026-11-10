@@ -30,7 +30,8 @@ DB_NAME          = os.environ.get("DB_NAME")                     # base de datos
 DB_USER          = os.environ.get("DB_USER")
 DB_PASS          = os.environ.get("DB_PASS")
 INSTANCE_CONN    = os.environ.get("INSTANCE_CONN")
-GEMINI_MODEL     = "gemini-2.5-flash-lite"
+#GEMINI_MODEL     = "gemini-2.5-flash-lite"
+GEMINI_MODEL     = "gemini-3.1-flash-lite"
 UMBRAL_CONFIANZA = 0.87                           # por debajo → manuscrito → atención humana
 LIMA_TZ          = timezone(timedelta(hours=-5)) # UTC-5, sin DST
 
@@ -1271,7 +1272,7 @@ def procesar_con_document_ai(archivo_bytes: bytes, mime_type: str):
 # ──────────────────────────────────────────────────────────────
 def analizar_con_gemini(texto_receta: str, max_reintentos: int = 4) -> dict:
     cliente_genai = genai.Client(
-        vertexai=True, project=PROJECT_ID, location="us-central1"
+        vertexai=True, project=PROJECT_ID, location="us"
     )
 
     grounding_tool = genai_types.Tool(google_search=genai_types.GoogleSearch())
