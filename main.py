@@ -14,6 +14,7 @@ import random
 from google.api_core.exceptions import ResourceExhausted
 import hashlib
 import base64
+from concurrent.futures import ThreadPoolExecutor
 
 from google import genai
 from google.genai import types as genai_types
@@ -61,6 +62,12 @@ MIME_PNG  = "image/png"
 MIME_WEBP = "image/webp"
 MIME_TIFF = "image/tiff"
 MIME_GIF  = "image/gif"
+MIMES_SOPORTADOS = {MIME_PDF, MIME_JPEG, MIME_PNG, MIME_WEBP, MIME_TIFF, MIME_GIF}
+
+# Receta en varias imagenes (campo opcional "rutas")
+MAX_ARCHIVOS_RECETA    = 5    # maximo de archivos por receta; el resto se ignora
+TIMEOUT_DESCARGA_MULTI = 20   # segundos por descarga (en paralelo)
+TIMEOUT_OCR_MULTI      = 40   # segundos por llamada a Document AI (en paralelo)
 
 # ──────────────────────────────────────────────────────────────
 # SEGURIDAD DASHBOARD — clave por query string (?key=...)
@@ -376,7 +383,8 @@ def handle_dashboard_recetas(request):
                 COUNT(*) FILTER (WHERE estado = 'rechazado') AS total_rechazado,
                 COUNT(*) FILTER (WHERE estado = 'revision')  AS total_estado_revision,
                 COUNT(*) FILTER (WHERE requiere_revision AND confianza_ocr < 0.87)  AS total_por_ocr_bajo,
-                COUNT(*) FILTER (WHERE requiere_revision AND confianza_ocr >= 0.87) AS total_por_motivo_ia
+                COUNT(*) FILTER (WHERE requiere_revision AND confianza_ocr >= 0.87) AS total_por_motivo_ia,
+                COUNT(DISTINCT NULLIF(upper(trim(dni_paciente)), '')) AS total_clientes_unicos
             FROM recetas
             WHERE created_at >= %s AND created_at < %s
         """, (fecha_inicio, fecha_fin))
@@ -389,6 +397,7 @@ def handle_dashboard_recetas(request):
         total_estado_revision  = row[5] or 0
         total_por_ocr_bajo     = row[6] or 0
         total_por_motivo_ia    = row[7] or 0
+        total_clientes_unicos  = row[8] or 0
         pct_revision_humana    = round((total_revision_humana / total_recetas) * 100, 1) if total_recetas else 0
         pct_por_ocr_bajo       = round((total_por_ocr_bajo / total_revision_humana) * 100, 1) if total_revision_humana else 0
         pct_por_motivo_ia      = round((total_por_motivo_ia / total_revision_humana) * 100, 1) if total_revision_humana else 0
@@ -831,6 +840,7 @@ def handle_dashboard_recetas(request):
 
   <div class="kpis">
     <div class="kpi"><div class="valor">{total_recetas}</div><div class="label">Recetas recibidas</div></div>
+    <div class="kpi"><div class="valor">{total_clientes_unicos}</div><div class="label">Clientes atendidos (DNI únicos)</div></div>
     <div class="kpi"><div class="valor">{total_revision_humana} ({pct_revision_humana}%)</div><div class="label">Requirió atención humana</div></div>
     <div class="kpi"><div class="valor">{total_por_ocr_bajo} ({pct_por_ocr_bajo}%)</div><div class="label">↳ Por manuscrito / OCR bajo</div></div>
     <div class="kpi"><div class="valor">{total_por_motivo_ia} ({pct_por_motivo_ia}%)</div><div class="label">↳ Por motivo detectado por IA</div></div>
@@ -1099,6 +1109,21 @@ def procesar_receta(request):
         doi     = data.get("doi", "").strip()
         chat_id = data.get("chat_id", "").strip()
 
+        # Campo opcional "rutas": receta en varias imagenes/paginas.
+        # Si no viene o trae un solo elemento, el flujo es el de siempre (solo "ruta").
+        rutas_in = data.get("rutas")
+        rutas = []
+        if isinstance(rutas_in, list):
+            rutas = [r.strip() for r in rutas_in if isinstance(r, str) and r.strip()]
+        if not ruta and rutas:
+            ruta = rutas[0]
+
+        if len(rutas) > 1:
+            if not celular:
+                return (json.dumps({"error": "El campo 'celular' es obligatorio"}), 400, HEADERS)
+            print(f"[INFO] Receta recibida (multi-imagen: {len(rutas)}) — celular={celular} doi={doi} chat_id={chat_id}")
+            return _procesar_receta_multi(celular, doi, chat_id, rutas)
+
         if not ruta:
             return (json.dumps({"error": "El campo 'ruta' es obligatorio"}), 400, HEADERS)
         if not celular:
@@ -1221,8 +1246,8 @@ def procesar_receta(request):
 # ──────────────────────────────────────────────────────────────
 # PASO 2: DESCARGAR ARCHIVO
 # ──────────────────────────────────────────────────────────────
-def descargar_archivo(url: str) -> bytes:
-    response = requests.get(url, timeout=60)  # 60s para PDFs grandes
+def descargar_archivo(url: str, timeout: int = 60) -> bytes:
+    response = requests.get(url, timeout=timeout)  # 60s por defecto para PDFs grandes
     response.raise_for_status()
     return response.content
 
@@ -1270,10 +1295,23 @@ def procesar_con_document_ai(archivo_bytes: bytes, mime_type: str):
 # PASO 5: GEMINI — ANÁLISIS Y ESTRUCTURACIÓN
 # Modifica el prompt aquí para afinar la extracción
 # ──────────────────────────────────────────────────────────────
-def analizar_con_gemini(texto_receta: str, max_reintentos: int = 4) -> dict:
+def analizar_con_gemini(texto_receta: str, max_reintentos: int = 4, num_imagenes: int = 1) -> dict:
     cliente_genai = genai.Client(
         vertexai=True, project=PROJECT_ID, location="us"
     )
+
+    # Reglas extra solo para recetas en varias imagenes (con 1 imagen el prompt no cambia)
+    bloque_multipagina = ""
+    if num_imagenes > 1:
+        bloque_multipagina = f"""
+    - CRITICO — RECETA EN VARIAS IMAGENES: el texto contiene {num_imagenes} imagenes/paginas de UNA SOLA
+    receta, separadas por marcadores "=== IMAGEN X DE {num_imagenes} ===". Devuelve UN SOLO JSON consolidado.
+    Toma nombre_paciente, dni_paciente, nombre_medico, cmp_medico, fecha_emision, aseguradora, ruc_clinica
+    y nombre_clinica de la imagen donde aparezcan (si aparecen en varias, usa el valor mas completo y legible).
+    En "medicamentos" incluye los de TODAS las imagenes, sin repetir un mismo medicamento si aparece en mas
+    de una imagen. Lo mismo para "diagnosticos".
+    Si las imagenes parecen corresponder a pacientes distintos, requiere_revision=true con
+    motivo_revision="IMAGENES DE PACIENTES DISTINTOS"."""
 
     grounding_tool = genai_types.Tool(google_search=genai_types.GoogleSearch())
 
@@ -1361,7 +1399,7 @@ def analizar_con_gemini(texto_receta: str, max_reintentos: int = 4) -> dict:
     Generalmente aparece en el encabezado o pie de pagina del documento, junto a la razon social.
     Si no aparece ningun RUC en el texto, dejar el campo vacio "".
     - nombre_clinica: la razon social o nombre comercial de la clinica/centro medico que emite la receta
-    (normalmente en el encabezado, junto al RUC o el logo). Si no se identifica con certeza, dejar vacio ""."""
+    (normalmente en el encabezado, junto al RUC o el logo). Si no se identifica con certeza, dejar vacio "".{bloque_multipagina}"""
 
     respuesta = None
     for intento in range(max_reintentos):
@@ -1398,7 +1436,8 @@ def analizar_con_gemini(texto_receta: str, max_reintentos: int = 4) -> dict:
 # ──────────────────────────────────────────────────────────────
 def guardar_receta_manuscrita(
     celular: str, doi: str, chat_id: str,
-    archivo_url: str, analisis: dict, confianza_ocr: float
+    archivo_url: str, analisis: dict, confianza_ocr: float,
+    info_multi: dict = None
 ) -> int:
     now_lima = datetime.now(LIMA_TZ).replace(tzinfo=None)
     conn, connector = get_db_connection()
@@ -1414,6 +1453,8 @@ def guardar_receta_manuscrita(
             now_lima=now_lima,
             analisis=analisis,
         )
+        if info_multi:
+            _guardar_archivos_multi(cur, receta_id, info_multi)
 
         # Diagnosticos/medicamentos que Gemini sí logró leer, como referencia
         for diag in analisis.get("diagnosticos", []):
@@ -1446,7 +1487,7 @@ def guardar_receta_manuscrita(
             VALUES (%s,%s,%s,%s)
         """, (
             receta_id, "recibida",
-            f"Manuscrito detectado. Confianza OCR: {confianza_ocr}",
+            f"Manuscrito detectado. Confianza OCR: {confianza_ocr}" + _detalle_evento_multi(info_multi),
             now_lima
         ))
 
@@ -1472,7 +1513,8 @@ def guardar_receta_manuscrita(
 # ──────────────────────────────────────────────────────────────
 def guardar_en_base_datos(
     celular: str, doi: str, chat_id: str,
-    archivo_url: str, analisis: dict, confianza_ocr: float
+    archivo_url: str, analisis: dict, confianza_ocr: float,
+    info_multi: dict = None
 ) -> int:
     now_lima = datetime.now(LIMA_TZ).replace(tzinfo=None)
     conn, connector = get_db_connection()
@@ -1489,6 +1531,8 @@ def guardar_en_base_datos(
             now_lima=now_lima,
             analisis=analisis,
         )
+        if info_multi:
+            _guardar_archivos_multi(cur, receta_id, info_multi)
 
         for diag in analisis.get("diagnosticos", []):
             cur.execute("""
@@ -1529,7 +1573,7 @@ def guardar_en_base_datos(
             VALUES (%s,%s,%s,%s)
         """, (
             receta_id, "recibida",
-            f"Confianza OCR: {confianza_ocr} | Estado: {analisis.get('estado_cobertura')}",
+            f"Confianza OCR: {confianza_ocr} | Estado: {analisis.get('estado_cobertura')}" + _detalle_evento_multi(info_multi),
             now_lima
         ))
 
@@ -1733,6 +1777,295 @@ def _insertar_receta(
         now_lima, now_lima
     ))
     return cur.fetchone()[0]
+
+# ──────────────────────────────────────────────────────────────
+# RECETA EN VARIAS IMAGENES — campo opcional "rutas" (2 a 5 URLs)
+# Se descargan y se pasan por OCR en paralelo, se junta el texto en
+# orden como paginas de UNA receta y se hace UNA sola extraccion.
+# ──────────────────────────────────────────────────────────────
+EXT_POR_MIME = {
+    MIME_PDF: "pdf", MIME_JPEG: "jpg", MIME_PNG: "png",
+    MIME_WEBP: "webp", MIME_TIFF: "tiff", MIME_GIF: "gif",
+}
+
+def _detectar_mime_por_contenido(contenido: bytes):
+    """Detecta el tipo real por los primeros bytes (las URLs firmadas no siempre traen extension)."""
+    if not contenido:
+        return None
+    if contenido.startswith(b"%PDF"):
+        return MIME_PDF
+    if contenido.startswith(b"\x89PNG\r\n\x1a\n"):
+        return MIME_PNG
+    if contenido[:3] == b"\xff\xd8\xff":
+        return MIME_JPEG
+    if contenido[:4] == b"RIFF" and contenido[8:12] == b"WEBP":
+        return MIME_WEBP
+    if contenido[:4] in (b"II*\x00", b"MM\x00*"):
+        return MIME_TIFF
+    if contenido[:6] in (b"GIF87a", b"GIF89a"):
+        return MIME_GIF
+    return None
+
+
+def _mime_por_extension(url: str):
+    """Como detectar_mime_type pero sin HEAD (una URL firmada para GET falla con HEAD)."""
+    ruta_lower = url.lower().split("?")[0]
+    for ext, mime in ((".pdf", MIME_PDF), (".png", MIME_PNG), (".webp", MIME_WEBP),
+                      (".tiff", MIME_TIFF), (".tif", MIME_TIFF), (".gif", MIME_GIF),
+                      (".jpg", MIME_JPEG), (".jpeg", MIME_JPEG)):
+        if ruta_lower.endswith(ext):
+            return mime
+    return None
+
+
+def _ocr_document_ai(archivo_bytes: bytes, mime_type: str, timeout: float = None):
+    """OCR de un archivo (todas sus paginas si es PDF). Devuelve (texto, lista_de_confianzas)."""
+    cliente   = documentai.DocumentProcessorServiceClient()
+    nombre    = cliente.processor_path(PROJECT_ID, LOCATION, PROCESSOR_ID)
+    documento = documentai.RawDocument(content=archivo_bytes, mime_type=mime_type)
+    req       = documentai.ProcessRequest(name=nombre, raw_document=documento)
+    resultado = cliente.process_document(request=req, timeout=timeout)
+    doc       = resultado.document
+
+    confidences = []
+    for page in doc.pages:
+        for token in page.tokens:
+            if hasattr(token, "layout") and hasattr(token.layout, "confidence"):
+                confidences.append(token.layout.confidence)
+    return doc.text, confidences
+
+
+def _procesar_archivo_multi(indice: int, url: str, celular: str, ts: str) -> dict:
+    """Descarga + Storage + OCR de UN archivo. Nunca lanza excepcion: devuelve ok/error."""
+    res = {
+        "indice": indice, "ok": False, "archivo": None, "mime": None,
+        "texto": "", "confidences": [], "confianza": None, "error": None,
+    }
+    etapa = "DESCARGA"
+    try:
+        contenido = descargar_archivo(url, timeout=TIMEOUT_DESCARGA_MULTI)
+        if not contenido:
+            raise ValueError("archivo vacio")
+
+        etapa = "FORMATO"
+        mime = _detectar_mime_por_contenido(contenido) or _mime_por_extension(url)
+        if mime not in MIMES_SOPORTADOS:
+            raise ValueError(f"formato no soportado ({mime or 'desconocido'})")
+        res["mime"] = mime
+
+        # Storage: si falla se registra en log, pero no se pierde la lectura de la imagen
+        archivo_nombre = f"recetas-entrantes/{celular}_{ts}_{indice}.{EXT_POR_MIME.get(mime, 'bin')}"
+        try:
+            guardar_en_storage(contenido, archivo_nombre, mime)
+            res["archivo"] = archivo_nombre
+        except Exception as e_sto:
+            print(f"[WARN] Imagen {indice}: no se pudo guardar en Storage: {e_sto}")
+
+        etapa = "OCR"
+        texto, confidences = _ocr_document_ai(contenido, mime, timeout=TIMEOUT_OCR_MULTI)
+        res["texto"]       = texto or ""
+        res["confidences"] = confidences
+        res["confianza"]   = round(sum(confidences) / len(confidences), 4) if confidences else 1.0
+        res["ok"]          = True
+        print(f"[INFO] Imagen {indice}: {mime} | confianza OCR {res['confianza']} | {len(res['texto'])} chars")
+    except Exception as e:
+        res["error"] = f"{etapa}: {str(e)}"[:300]
+        # No se imprime la URL firmada (contiene la firma de acceso)
+        print(f"[ERROR] Imagen {indice} no procesada — {res['error']}")
+    return res
+
+
+def _deduplicar_medicamentos(medicamentos: list) -> list:
+    """Respaldo al prompt: quita medicamentos repetidos de forma identica entre paginas."""
+    vistos, resultado = set(), []
+    for m in medicamentos or []:
+        if not isinstance(m, dict):
+            continue
+        clave = tuple(
+            re.sub(r"\s+", " ", str(m.get(k) or "")).strip().upper()
+            for k in ("nombre", "principio_activo", "dosis", "frecuencia")
+        )
+        if clave in vistos:
+            print(f"[INFO] Medicamento duplicado entre imagenes omitido: {clave[0]}")
+            continue
+        vistos.add(clave)
+        resultado.append(m)
+    return resultado
+
+
+def _guardar_archivos_multi(cur, receta_id: int, info_multi: dict):
+    """Guarda en recetas la referencia a todos los archivos de la receta."""
+    cur.execute("""
+        UPDATE recetas
+        SET archivos_urls       = CAST(%s AS JSONB),
+            cantidad_imagenes   = %s,
+            imagenes_procesadas = %s
+        WHERE id = %s
+    """, (
+        json.dumps(info_multi.get("archivos", []), ensure_ascii=False),
+        info_multi.get("recibidas"),
+        info_multi.get("procesadas"),
+        receta_id,
+    ))
+
+
+def _detalle_evento_multi(info_multi: dict) -> str:
+    """Sufijo para receta_eventos.detalle (vacio en recetas de una sola imagen)."""
+    if not info_multi:
+        return ""
+    detalle = f" | Imagenes: {info_multi.get('procesadas')}/{info_multi.get('recibidas')} procesadas"
+    errores = info_multi.get("errores") or []
+    if errores:
+        detalle += " | Errores: " + "; ".join(f"#{e['imagen']} {e['motivo']}" for e in errores)
+    return detalle[:1000]
+
+
+def _procesar_receta_multi(celular: str, doi: str, chat_id: str, rutas: list):
+    total_recibidas = len(rutas)
+    errores = []
+    if total_recibidas > MAX_ARCHIVOS_RECETA:
+        print(f"[WARN] Se recibieron {total_recibidas} archivos; se procesan solo los primeros "
+              f"{MAX_ARCHIVOS_RECETA} y se ignoran los demas")
+        for i in range(MAX_ARCHIVOS_RECETA + 1, total_recibidas + 1):
+            errores.append({"imagen": i, "motivo": f"IGNORADA: EXCEDE EL MAXIMO DE {MAX_ARCHIVOS_RECETA} ARCHIVOS"})
+        rutas = rutas[:MAX_ARCHIVOS_RECETA]
+
+    # ── PASOS 1-4 en paralelo: descarga + Storage + OCR por archivo ──
+    t0 = time.time()
+    ts = datetime.now(LIMA_TZ).strftime('%Y%m%d_%H%M%S')
+    with ThreadPoolExecutor(max_workers=len(rutas)) as ex:
+        resultados = list(ex.map(
+            lambda par: _procesar_archivo_multi(par[0], par[1], celular, ts),
+            enumerate(rutas, start=1)
+        ))
+    print(f"[INFO] Descarga + OCR de {len(rutas)} archivos en {time.time() - t0:.1f}s")
+
+    ok = [r for r in resultados if r["ok"]]
+    errores = [{"imagen": r["indice"], "motivo": r["error"]} for r in resultados if not r["ok"]] + errores
+
+    if not ok:
+        return (json.dumps({
+            "error": f"No se pudo procesar ninguna de las {total_recibidas} imagenes de la receta",
+            "imagenes_recibidas":  total_recibidas,
+            "imagenes_procesadas": 0,
+            "imagenes_con_error":  errores,
+        }, ensure_ascii=False), 500, HEADERS)
+
+    # ── Unir texto en orden como paginas de UNA receta ──
+    n_ok = len(ok)
+    texto_extraido = "\n\n".join(
+        f"=== IMAGEN {k} DE {n_ok} ===\n{r['texto']}" for k, r in enumerate(ok, start=1)
+    )
+    todas_conf     = [c for r in ok for c in r["confidences"]]
+    confianza_ocr  = round(sum(todas_conf) / len(todas_conf), 4) if todas_conf else 1.0
+    imgs_bajas     = [r["indice"] for r in ok if r["confianza"] < UMBRAL_CONFIANZA]
+    tiene_manuscrito = bool(imgs_bajas)  # basta UNA imagen con OCR bajo
+    es_pdf_flag    = any(r["mime"] == MIME_PDF for r in ok)
+    archivos       = [r["archivo"] for r in ok if r["archivo"]]
+    archivo_nombre = archivos[0] if archivos else ""
+
+    print(f"[INFO] OCR multi — confianza global: {confianza_ocr} | imagenes con OCR bajo: {imgs_bajas}")
+
+    info_multi = {
+        "archivos":   archivos,
+        "recibidas":  total_recibidas,
+        "procesadas": n_ok,
+        "errores":    errores,
+    }
+
+    # ── PASO 5: una sola extraccion con Gemini ──
+    t1 = time.time()
+    analisis = analizar_con_gemini(texto_extraido, num_imagenes=n_ok)
+    print(f"[INFO] Gemini multi en {time.time() - t1:.1f}s | Estado cobertura: {analisis.get('estado_cobertura')}")
+    analisis["medicamentos"] = _deduplicar_medicamentos(analisis.get("medicamentos", []))
+
+    analisis["confianza_ocr"]    = confianza_ocr
+    analisis["tiene_manuscrito"] = tiene_manuscrito
+
+    if tiene_manuscrito:
+        analisis["atencion_humana"]        = True
+        analisis["motivo_atencion_humana"] = (
+            "TEXTO MANUSCRITO O CONFIANZA OCR BAJA (< 90%) — IMAGEN "
+            + ", ".join(str(i) for i in imgs_bajas)
+        )
+    elif analisis.get("requiere_revision", False):
+        analisis["atencion_humana"]        = True
+        analisis["motivo_atencion_humana"] = analisis.get("motivo_revision", "").upper()
+    else:
+        analisis["atencion_humana"]        = False
+        analisis["motivo_atencion_humana"] = ""
+
+    campos_multi = {
+        "imagenes_recibidas":  total_recibidas,
+        "imagenes_procesadas": n_ok,
+        "imagenes_con_error":  errores,
+    }
+
+    # ── PASO 6: un solo registro ──
+    if tiene_manuscrito:
+        receta_id, tiene_programa = guardar_receta_manuscrita(
+            celular, doi, chat_id, archivo_nombre, analisis, confianza_ocr, info_multi=info_multi
+        )
+        print(f"[INFO] Manuscrito detectado (multi) — derivando a atencion humana | total {time.time() - t0:.1f}s")
+        respuesta = {
+            "status":                 "revision_humana",
+            "receta_id":              receta_id,
+            "confianza_ocr":          confianza_ocr,
+            "tiene_manuscrito":       True,
+            "atencion_humana":        True,
+            "motivo_atencion_humana": analisis["motivo_atencion_humana"],
+            "para_programas":         MENSAJE_PROGRAMAS if tiene_programa else MENSAJE_SIN_PROGRAMAS,
+            "datos_extraidos": {
+                "paciente":       analisis.get("nombre_paciente"),
+                "dni":            analisis.get("dni_paciente"),
+                "medico":         analisis.get("nombre_medico"),
+                "cmp":            analisis.get("cmp_medico"),
+                "fecha_emision":  analisis.get("fecha_emision"),
+                "aseguradora":    analisis.get("aseguradora"),
+                "ruc_clinica":    analisis.get("ruc_clinica"),
+                "nombre_clinica": analisis.get("nombre_clinica"),
+            },
+            "respuesta_paciente": f"✅ Hemos recibido correctamente tu receta #{receta_id}",
+        }
+        respuesta.update(campos_multi)
+        return (json.dumps(respuesta, ensure_ascii=False), 200, HEADERS)
+
+    receta_id, tiene_programa = guardar_en_base_datos(
+        celular, doi, chat_id, archivo_nombre, analisis, confianza_ocr, info_multi=info_multi
+    )
+
+    # ── PASO 7: misma salida que con una imagen + campos opcionales ──
+    resumen            = construir_resumen(analisis)
+    respuesta_paciente = generar_respuesta_paciente(analisis, receta_id)
+    print(f"[INFO] Receta multi #{receta_id} procesada en {time.time() - t0:.1f}s")
+
+    respuesta = {
+        "status":                 "ok",
+        "receta_id":              receta_id,
+        "confianza_ocr":          confianza_ocr,
+        "tiene_manuscrito":       tiene_manuscrito,
+        "es_pdf":                 es_pdf_flag,
+        "atencion_humana":        analisis["atencion_humana"],
+        "motivo_atencion_humana": analisis["motivo_atencion_humana"],
+        "resumen_receta":         resumen,
+        "para_programas":         MENSAJE_PROGRAMAS if tiene_programa else MENSAJE_SIN_PROGRAMAS,
+        "datos_extraidos": {
+            "paciente":       analisis.get("nombre_paciente"),
+            "dni":            analisis.get("dni_paciente"),
+            "medico":         analisis.get("nombre_medico"),
+            "cmp":            analisis.get("cmp_medico"),
+            "fecha_emision":  analisis.get("fecha_emision"),
+            "aseguradora":    analisis.get("aseguradora"),
+            "ruc_clinica":    analisis.get("ruc_clinica"),
+            "nombre_clinica": analisis.get("nombre_clinica"),
+            "diagnosticos":   analisis.get("diagnosticos", []),
+            "medicamentos":   analisis.get("medicamentos", [])
+        },
+        "estado_cobertura":   analisis.get("estado_cobertura"),
+        "respuesta_paciente": respuesta_paciente,
+    }
+    respuesta.update(campos_multi)
+    return (json.dumps(respuesta, ensure_ascii=False), 200, HEADERS)
 
 # ──────────────────────────────────────────────────────────────
 # SMS PROGRAMAS DE SALUD — envío vía Danaconnect + registro
